@@ -87,12 +87,11 @@ Read [references/batch-format.md](references/batch-format.md) before preparing a
 
 ## Configuration and safety
 
-- Read the API base from `CODEX_API_URL` or `~/.codex/config.toml`; default to `https://apinebula.com`.
-- Require `CODEX_API_KEY` or `~/.codex/config.toml`. Never place it in a command, file, prompt, log, or response.
+- Read the API base from `CODEX_API_URL` or `~/.codex/config.toml` `model_provider` and `model_providers.<name>.base_url`; default to `https://apinebula.com`.
+- Read the API key from `CODEX_API_KEY` or `~/.codex/auth.json` `OPENAI_API_KEY`. Never place it in a command, file, prompt, log, or response.
 - If the key is absent, tell the user to set it locally and confirm when ready. Never ask them to paste it into chat.
-- Default to model `gpt-image-2`, size `1024x1024`, and quality `auto`.
+- Default to the model from `~/.codex/config.toml`, size `1024x1024`, and quality `auto`; use `--model` when the configured Codex model is not an image model.
 - Use `--dry-run` to validate a request without network access or requiring a key.
-- Use `--config` to point at a custom `config.toml` when needed.
 - Save project-bound assets inside the current project. The CLI default is `output/imagegen/`.
 - Do not overwrite files unless the user explicitly authorizes it and `--force` is passed.
 - Native transparent output is not guaranteed. Do not promise it or silently switch tools.

@@ -38,7 +38,7 @@ type commonArgs struct {
 	quality     string
 	n           int
 	outDir      string
-	configPath  string
+	modelSet    bool
 	force       bool
 	dryRun      bool
 	maxAttempts int
@@ -48,6 +48,7 @@ type commonArgs struct {
 type runtimeConfig struct {
 	apiURL string
 	apiKey string
+	model  string
 }
 
 type apiResponse struct {
@@ -158,10 +159,11 @@ func checkOutputs(paths []string, force bool) error {
 	return nil
 }
 
-// defaultConfigPath 返回用户级 Codex 配置文件路径。
+// codexConfigPath 返回用户级 Codex 配置文件路径。
 //
+// @param name 配置文件名称。
 // @return 默认配置文件路径；无法定位用户目录时返回空字符串。
-func defaultConfigPath() string {
+func codexConfigPath(name string) string {
 	// 定位当前用户主目录。
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {
@@ -169,26 +171,7 @@ func defaultConfigPath() string {
 	}
 
 	// 返回 Codex 用户级配置文件。
-	return filepath.Join(home, ".codex", "config.toml")
-}
-
-// resolveConfigPath 解析实际使用的配置文件路径。
-//
-// @param explicitPath 命令行显式传入的配置文件路径。
-// @return 需要读取的配置文件路径。
-func resolveConfigPath(explicitPath string) string {
-	// 优先使用命令行指定路径。
-	if strings.TrimSpace(explicitPath) != "" {
-		return strings.TrimSpace(explicitPath)
-	}
-
-	// 其次使用专用环境变量指定路径。
-	if envPath := strings.TrimSpace(os.Getenv("CODEX_IMAGE2_CONFIG")); envPath != "" {
-		return envPath
-	}
-
-	// 默认读取用户级 Codex 配置。
-	return defaultConfigPath()
+	return filepath.Join(home, ".codex", name)
 }
 
 // stripTOMLComment 移除 TOML 行尾注释。
@@ -258,11 +241,41 @@ func parseTOMLString(value string) (string, bool) {
 	return strings.TrimSpace(value), true
 }
 
-// readConfigFile 从 TOML 配置中读取 codex-image2 专用配置。
+// readAuthFile 从 Codex auth.json 读取 API 密钥。
 //
-// @param path 配置文件路径。
+// @param path auth.json 文件路径。
 // @return 文件中的 API 配置和读取错误。
-func readConfigFile(path string) (runtimeConfig, error) {
+func readAuthFile(path string) (runtimeConfig, error) {
+	var config runtimeConfig
+	if strings.TrimSpace(path) == "" {
+		return config, nil
+	}
+
+	// 读取认证文件，不存在时视为未配置。
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return config, nil
+	}
+	if err != nil {
+		return config, fmt.Errorf("could not read auth file: %w", err)
+	}
+
+	// 解析 Codex 标准密钥字段。
+	var auth struct {
+		OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+	}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return config, fmt.Errorf("could not parse auth file: %w", err)
+	}
+	config.apiKey = strings.TrimSpace(auth.OpenAIAPIKey)
+	return config, nil
+}
+
+// readCodexConfig 从 Codex config.toml 读取供应商地址和模型。
+//
+// @param path config.toml 文件路径。
+// @return 文件中的 API 配置和读取错误。
+func readCodexConfig(path string) (runtimeConfig, error) {
 	var config runtimeConfig
 	if strings.TrimSpace(path) == "" {
 		return config, nil
@@ -277,23 +290,21 @@ func readConfigFile(path string) (runtimeConfig, error) {
 		return config, fmt.Errorf("could not read config file: %w", err)
 	}
 
-	// 扫描目标配置区块。
-	table := ""
+	// 扫描 Codex 选定模型和供应商配置。
 	scanner := bufio.NewScanner(bytes.NewReader(data))
+	currentTable := ""
+	modelProvider := ""
+	baseURL := ""
+	providerBaseURLs := map[string]string{}
 	for scanner.Scan() {
 		line := stripTOMLComment(scanner.Text())
 		if line == "" {
 			continue
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			table = strings.TrimSpace(line[1 : len(line)-1])
+			currentTable = strings.TrimSpace(line[1 : len(line)-1])
 			continue
 		}
-		if table != "codex_image2" && table != "codex-image2" {
-			continue
-		}
-
-		// 解析配置键值。
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -303,31 +314,56 @@ func readConfigFile(path string) (runtimeConfig, error) {
 		if !ok {
 			continue
 		}
-		switch key {
-		case "api_url", "api-url", "base_url", "base-url":
-			config.apiURL = value
-		case "api_key", "api-key":
-			config.apiKey = value
+		if currentTable == "" {
+			switch key {
+			case "model_provider":
+				modelProvider = value
+			case "model":
+				config.model = value
+			case "base_url":
+				baseURL = value
+			}
+			continue
+		}
+		if strings.HasPrefix(currentTable, "model_providers.") && key == "base_url" {
+			provider := strings.TrimPrefix(currentTable, "model_providers.")
+			providerBaseURLs[provider] = value
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return config, fmt.Errorf("could not scan config file: %w", err)
 	}
+
+	if selected := strings.TrimSpace(modelProvider); selected != "" {
+		if resolved := strings.TrimSpace(providerBaseURLs[selected]); resolved != "" {
+			config.apiURL = resolved
+		}
+	}
+	if strings.TrimSpace(config.apiURL) == "" {
+		config.apiURL = strings.TrimSpace(baseURL)
+	}
 	return config, nil
 }
 
-// loadRuntimeConfig 合并配置文件和环境变量中的运行时配置。
+// loadRuntimeConfig 合并 Codex 配置文件和环境变量中的运行时配置。
 //
-// @param configPath 命令行传入的配置文件路径。
 // @return 合并后的运行时配置和读取错误。
-func loadRuntimeConfig(configPath string) (runtimeConfig, error) {
-	// 先读取配置文件。
-	config, err := readConfigFile(resolveConfigPath(configPath))
+func loadRuntimeConfig() (runtimeConfig, error) {
+	// 先读取 Codex 认证文件。
+	config, err := readAuthFile(codexConfigPath("auth.json"))
 	if err != nil {
 		return config, err
 	}
 
-	// 使用环境变量覆盖配置文件，保持已有行为和临时覆盖能力。
+	// 再读取 Codex 主配置文件。
+	codexConfig, err := readCodexConfig(codexConfigPath("config.toml"))
+	if err != nil {
+		return config, err
+	}
+	config.apiURL = codexConfig.apiURL
+	config.model = codexConfig.model
+
+	// 使用环境变量覆盖 Codex 配置，保持已有行为和临时覆盖能力。
 	if apiURL := strings.TrimSpace(os.Getenv("CODEX_API_URL")); apiURL != "" {
 		config.apiURL = apiURL
 	}
@@ -354,10 +390,10 @@ func apiBase(config runtimeConfig) string {
 // @param config 已合并的运行时配置。
 // @return API 密钥和校验错误。
 func apiKey(config runtimeConfig) (string, error) {
-	// 校验密钥是否已通过环境变量或 config.toml 配置。
+	// 校验密钥是否已通过环境变量或 auth.json 配置。
 	key := strings.TrimSpace(config.apiKey)
 	if key == "" {
-		return "", errors.New("CODEX_API_KEY or [codex_image2].api_key is not set; set it locally, then retry")
+		return "", errors.New("CODEX_API_KEY or ~/.codex/auth.json OPENAI_API_KEY is not set; set it locally, then retry")
 	}
 	return key, nil
 }
@@ -459,7 +495,7 @@ func saveImages(images [][]byte, paths []string) ([]string, error) {
 // @return 生成结果摘要和执行错误。
 func generate(prompt, out string, args commonArgs) (map[string]any, error) {
 	// 加载运行时配置。
-	config, err := loadRuntimeConfig(args.configPath)
+	config, err := loadRuntimeConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -467,6 +503,10 @@ func generate(prompt, out string, args commonArgs) (map[string]any, error) {
 	// 校验通用参数。
 	if err := validateCommon(args); err != nil {
 		return nil, err
+	}
+	// 使用 Codex 配置中的模型作为默认值。
+	if strings.TrimSpace(config.model) != "" && !args.modelSet {
+		args.model = config.model
 	}
 	// 计算并检查输出路径。
 	paths := outputPaths(out, args.outDir, prompt, args.n)
@@ -517,7 +557,7 @@ func generate(prompt, out string, args commonArgs) (map[string]any, error) {
 // @return 编辑结果摘要和执行错误。
 func edit(prompt string, imagePaths []string, mask, out string, args commonArgs) (map[string]any, error) {
 	// 加载运行时配置。
-	config, err := loadRuntimeConfig(args.configPath)
+	config, err := loadRuntimeConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -525,6 +565,10 @@ func edit(prompt string, imagePaths []string, mask, out string, args commonArgs)
 	// 校验通用参数和输入文件。
 	if err := validateCommon(args); err != nil {
 		return nil, err
+	}
+	// 使用 Codex 配置中的模型作为默认值。
+	if strings.TrimSpace(config.model) != "" && !args.modelSet {
+		args.model = config.model
 	}
 	for _, path := range append(append([]string{}, imagePaths...), mask) {
 		if path == "" {
@@ -629,7 +673,6 @@ func parseCommon(fs *flag.FlagSet, argv []string, args *commonArgs) error {
 	fs.StringVar(&args.quality, "quality", defaultQuality, "low, medium, high, or auto")
 	fs.IntVar(&args.n, "n", 1, "number of variants (1-10)")
 	fs.StringVar(&args.outDir, "out-dir", defaultOutDir, "default output directory")
-	fs.StringVar(&args.configPath, "config", "", "optional config.toml path")
 	fs.BoolVar(&args.force, "force", false, "overwrite existing outputs")
 	fs.BoolVar(&args.dryRun, "dry-run", false, "validate without network access")
 	fs.IntVar(&args.maxAttempts, "max-attempts", 3, "maximum attempts")
@@ -637,6 +680,12 @@ func parseCommon(fs *flag.FlagSet, argv []string, args *commonArgs) error {
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
+	// 记录用户是否显式指定模型，避免被 config.toml 的模型覆盖。
+	fs.Visit(func(flag *flag.Flag) {
+		if flag.Name == "model" {
+			args.modelSet = true
+		}
+	})
 	args.timeout = time.Duration(timeout * float64(time.Second))
 	return nil
 }

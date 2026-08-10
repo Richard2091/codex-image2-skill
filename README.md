@@ -8,7 +8,7 @@
 
 于是我写了这个 Skill。原理很简单：
 
-1. 优先读取用户级 `config.toml`，必要时再用环境变量覆盖；
+1. 从 Codex 的 `auth.json` 读取 API Key，从 `config.toml` 读取供应商 Base URL 和模型；
 2. 直接调用 OpenAI 兼容的图片生成或编辑接口；
 3. 将返回的图片保存到项目中；
 4. 让 Codex 检查图片并展示最终结果。
@@ -61,19 +61,35 @@ cp -R codex-image2-skill/codex-image2 ~/.codex/skills/codex-image2
 
 ### 2. 配置 API 地址和密钥
 
-你可以选择两种方式。
+默认直接复用 Codex 已有配置：
 
-#### 方式一：写入 `~/.codex/config.toml`
+- Key：`~/.codex/auth.json` 中的 `OPENAI_API_KEY`
+- Base URL：`~/.codex/config.toml` 中当前 `model_provider` 对应的 `base_url`
+- 模型：`~/.codex/config.toml` 中的 `model`
 
-在用户目录的 `~/.codex/config.toml` 中添加：
+例如：
 
-```toml
-[codex_image2]
-api_url = "你的API地址"
-api_key = "你的API密钥"
+`~/.codex/auth.json`
+
+```json
+{
+  "OPENAI_API_KEY": "你的API密钥"
+}
 ```
 
-#### 方式二：使用环境变量
+`~/.codex/config.toml`
+
+```toml
+model_provider = "custom"
+model = "gpt-image-2"
+
+[model_providers.custom]
+base_url = "你的API地址"
+```
+
+如果 `config.toml` 中的 `model` 不是图片模型，可以在 CLI 中继续用 `--model gpt-image-2` 覆盖。
+
+也可以使用环境变量临时覆盖地址和密钥。
 
 在 PowerShell 中执行下面两条命令，可将环境变量永久保存到当前 Windows 用户：
 
@@ -92,21 +108,13 @@ https://example.com
 
 ![配置 Codex Image2 环境变量](http://image.fengfengzhidao.com/fengfeng_110920260715224031.png?key=fengfengbuzhidao)
 
-> `config.toml` 会在每次运行时重新读取；环境变量写入系统后，新的终端或 Codex 进程才会看到更新。
+> `auth.json` 和 `config.toml` 会在每次运行时重新读取；环境变量写入系统后，新的终端或 Codex 进程才会看到更新。
 
 macOS / Linux 用户可以将以下内容加入自己的 shell 配置文件：
 
 ```bash
 export CODEX_API_URL="你的API地址"
 export CODEX_API_KEY="你的API密钥"
-```
-
-如果你更习惯文件配置，也可以直接编辑 `~/.codex/config.toml`：
-
-```toml
-[codex_image2]
-api_url = "你的API地址"
-api_key = "你的API密钥"
 ```
 
 ### 3. 指定 Skill 生图
@@ -195,6 +203,8 @@ go build -trimpath -ldflags "-s -w" -o codex-image2/bin/codex-image2-windows-amd
 
 完全退出 Codex 后重新启动。已经打开的 Codex 进程不会自动读取新设置的用户环境变量。
 
+如果使用文件配置，请确认 `~/.codex/auth.json` 中存在 `OPENAI_API_KEY`。
+
 ### 接口返回 524 或超时
 
 这通常表示中转服务的图片生成耗时超过了网关限制。可以尝试降低质量、使用 `1024x1024`、减少批量并发，或稍后重试。
@@ -215,7 +225,7 @@ POST /v1/images/edits
 - 不要把真实 API Key 提交到 GitHub。
 - 不要把 Key 写进 Skill、提示词、截图或聊天消息。
 - 建议为不同服务使用独立密钥，并定期轮换。
-- 本 Skill 支持从 `~/.codex/config.toml` 或 `CODEX_API_KEY` 读取密钥，不会主动保存密钥。
+- 本 Skill 支持从 `~/.codex/auth.json` 或 `CODEX_API_KEY` 读取密钥，不会主动保存密钥。
 
 ## License
 
