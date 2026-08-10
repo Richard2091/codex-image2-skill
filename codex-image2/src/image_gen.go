@@ -801,6 +801,7 @@ func runBatch(argv []string) error {
 				jobArgs := args
 				if job.Model != "" {
 					jobArgs.model = job.Model
+					jobArgs.modelSet = true
 				}
 				if job.Size != "" {
 					jobArgs.size = job.Size
