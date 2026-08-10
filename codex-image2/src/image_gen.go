@@ -38,10 +38,16 @@ type commonArgs struct {
 	quality     string
 	n           int
 	outDir      string
+	configPath  string
 	force       bool
 	dryRun      bool
 	maxAttempts int
 	timeout     time.Duration
+}
+
+type runtimeConfig struct {
+	apiURL string
+	apiKey string
 }
 
 type apiResponse struct {
@@ -152,10 +158,206 @@ func checkOutputs(paths []string, force bool) error {
 	return nil
 }
 
-func apiKey() (string, error) {
-	key := strings.TrimSpace(os.Getenv("CODEX_API_KEY"))
+// defaultConfigPath 返回用户级 Codex 配置文件路径。
+//
+// @return 默认配置文件路径；无法定位用户目录时返回空字符串。
+func defaultConfigPath() string {
+	// 定位当前用户主目录。
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+
+	// 返回 Codex 用户级配置文件。
+	return filepath.Join(home, ".codex", "config.toml")
+}
+
+// resolveConfigPath 解析实际使用的配置文件路径。
+//
+// @param explicitPath 命令行显式传入的配置文件路径。
+// @return 需要读取的配置文件路径。
+func resolveConfigPath(explicitPath string) string {
+	// 优先使用命令行指定路径。
+	if strings.TrimSpace(explicitPath) != "" {
+		return strings.TrimSpace(explicitPath)
+	}
+
+	// 其次使用专用环境变量指定路径。
+	if envPath := strings.TrimSpace(os.Getenv("CODEX_IMAGE2_CONFIG")); envPath != "" {
+		return envPath
+	}
+
+	// 默认读取用户级 Codex 配置。
+	return defaultConfigPath()
+}
+
+// stripTOMLComment 移除 TOML 行尾注释。
+//
+// @param line 原始 TOML 行。
+// @return 去除注释后的内容。
+func stripTOMLComment(line string) string {
+	var quote rune
+	escaped := false
+	for index, value := range line {
+		// 处理字符串内部的转义和闭合。
+		if quote != 0 {
+			if quote == '"' && escaped {
+				escaped = false
+				continue
+			}
+			if quote == '"' && value == '\\' {
+				escaped = true
+				continue
+			}
+			if value == quote {
+				quote = 0
+			}
+			continue
+		}
+
+		// 进入字符串后忽略其中的 #。
+		if value == '"' || value == '\'' {
+			quote = value
+			continue
+		}
+
+		// 截断真正的注释内容。
+		if value == '#' {
+			return strings.TrimSpace(line[:index])
+		}
+	}
+	return strings.TrimSpace(line)
+}
+
+// parseTOMLString 解析本工具支持的简单 TOML 字符串值。
+//
+// @param value TOML 等号右侧的原始值。
+// @return 解析后的字符串和值是否有效。
+func parseTOMLString(value string) (string, bool) {
+	// 清理值两侧空白。
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+
+	// 解析双引号字符串，支持标准转义。
+	if strings.HasPrefix(value, "\"") {
+		parsed, err := strconv.Unquote(value)
+		if err != nil {
+			return "", false
+		}
+		return strings.TrimSpace(parsed), true
+	}
+
+	// 解析单引号字符串。
+	if strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") && len(value) >= 2 {
+		return strings.TrimSpace(value[1 : len(value)-1]), true
+	}
+
+	// 兼容无引号字符串。
+	return strings.TrimSpace(value), true
+}
+
+// readConfigFile 从 TOML 配置中读取 codex-image2 专用配置。
+//
+// @param path 配置文件路径。
+// @return 文件中的 API 配置和读取错误。
+func readConfigFile(path string) (runtimeConfig, error) {
+	var config runtimeConfig
+	if strings.TrimSpace(path) == "" {
+		return config, nil
+	}
+
+	// 读取配置文件，不存在时视为未配置。
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return config, nil
+	}
+	if err != nil {
+		return config, fmt.Errorf("could not read config file: %w", err)
+	}
+
+	// 扫描目标配置区块。
+	table := ""
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := stripTOMLComment(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			table = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		if table != "codex_image2" && table != "codex-image2" {
+			continue
+		}
+
+		// 解析配置键值。
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.Trim(strings.TrimSpace(parts[0]), "\"'")
+		value, ok := parseTOMLString(parts[1])
+		if !ok {
+			continue
+		}
+		switch key {
+		case "api_url", "api-url", "base_url", "base-url":
+			config.apiURL = value
+		case "api_key", "api-key":
+			config.apiKey = value
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return config, fmt.Errorf("could not scan config file: %w", err)
+	}
+	return config, nil
+}
+
+// loadRuntimeConfig 合并配置文件和环境变量中的运行时配置。
+//
+// @param configPath 命令行传入的配置文件路径。
+// @return 合并后的运行时配置和读取错误。
+func loadRuntimeConfig(configPath string) (runtimeConfig, error) {
+	// 先读取配置文件。
+	config, err := readConfigFile(resolveConfigPath(configPath))
+	if err != nil {
+		return config, err
+	}
+
+	// 使用环境变量覆盖配置文件，保持已有行为和临时覆盖能力。
+	if apiURL := strings.TrimSpace(os.Getenv("CODEX_API_URL")); apiURL != "" {
+		config.apiURL = apiURL
+	}
+	if apiKey := strings.TrimSpace(os.Getenv("CODEX_API_KEY")); apiKey != "" {
+		config.apiKey = apiKey
+	}
+	return config, nil
+}
+
+// apiBase 返回实际请求使用的 API 基础地址。
+//
+// @param config 已合并的运行时配置。
+// @return API 基础地址。
+func apiBase(config runtimeConfig) string {
+	// 配置缺失时使用默认中转地址。
+	if strings.TrimSpace(config.apiURL) == "" {
+		return defaultAPIURL
+	}
+	return config.apiURL
+}
+
+// apiKey 返回实际请求使用的 API 密钥。
+//
+// @param config 已合并的运行时配置。
+// @return API 密钥和校验错误。
+func apiKey(config runtimeConfig) (string, error) {
+	// 校验密钥是否已通过环境变量或 config.toml 配置。
+	key := strings.TrimSpace(config.apiKey)
 	if key == "" {
-		return "", errors.New("CODEX_API_KEY is not set; set it locally, then retry")
+		return "", errors.New("CODEX_API_KEY or [codex_image2].api_key is not set; set it locally, then retry")
 	}
 	return key, nil
 }
@@ -249,20 +451,35 @@ func saveImages(images [][]byte, paths []string) ([]string, error) {
 	return abs, nil
 }
 
+// generate 调用图片生成接口并保存返回图片。
+//
+// @param prompt 图片生成提示词。
+// @param out 输出文件路径。
+// @param args 通用命令参数。
+// @return 生成结果摘要和执行错误。
 func generate(prompt, out string, args commonArgs) (map[string]any, error) {
+	// 加载运行时配置。
+	config, err := loadRuntimeConfig(args.configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 校验通用参数。
 	if err := validateCommon(args); err != nil {
 		return nil, err
 	}
+	// 计算并检查输出路径。
 	paths := outputPaths(out, args.outDir, prompt, args.n)
 	if err := checkOutputs(paths, args.force); err != nil {
 		return nil, err
 	}
-	ep := endpoint(os.Getenv("CODEX_API_URL"), "generations")
+	ep := endpoint(apiBase(config), "generations")
 	payload := map[string]any{"model": args.model, "prompt": prompt, "size": args.size, "quality": args.quality, "n": args.n}
 	if args.dryRun {
 		return map[string]any{"dry_run": true, "endpoint": ep, "payload": payload, "outputs": paths}, nil
 	}
-	key, err := apiKey()
+	// 读取密钥并发起请求。
+	key, err := apiKey(config)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +507,22 @@ func generate(prompt, out string, args commonArgs) (map[string]any, error) {
 	return map[string]any{"model": args.model, "size": args.size, "quality": args.quality, "outputs": outputs}, nil
 }
 
+// edit 调用图片编辑接口并保存返回图片。
+//
+// @param prompt 图片编辑提示词。
+// @param imagePaths 输入图片路径列表。
+// @param mask 可选 PNG 蒙版路径。
+// @param out 输出文件路径。
+// @param args 通用命令参数。
+// @return 编辑结果摘要和执行错误。
 func edit(prompt string, imagePaths []string, mask, out string, args commonArgs) (map[string]any, error) {
+	// 加载运行时配置。
+	config, err := loadRuntimeConfig(args.configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 校验通用参数和输入文件。
 	if err := validateCommon(args); err != nil {
 		return nil, err
 	}
@@ -306,12 +538,13 @@ func edit(prompt string, imagePaths []string, mask, out string, args commonArgs)
 	if err := checkOutputs(paths, args.force); err != nil {
 		return nil, err
 	}
-	ep := endpoint(os.Getenv("CODEX_API_URL"), "edits")
+	ep := endpoint(apiBase(config), "edits")
 	fields := map[string]string{"model": args.model, "prompt": prompt, "size": args.size, "quality": args.quality, "n": strconv.Itoa(args.n)}
 	if args.dryRun {
 		return map[string]any{"dry_run": true, "endpoint": ep, "fields": fields, "images": imagePaths, "mask": mask, "outputs": paths}, nil
 	}
-	key, err := apiKey()
+	// 读取密钥并组装 multipart 请求。
+	key, err := apiKey(config)
 	if err != nil {
 		return nil, err
 	}
@@ -383,6 +616,12 @@ func printJSON(value any) {
 	_ = encoder.Encode(value)
 }
 
+// parseCommon 解析所有命令共享的 CLI 参数。
+//
+// @param fs 命令专用 FlagSet。
+// @param argv 命令参数。
+// @param args 通用参数接收对象。
+// @return 参数解析错误。
 func parseCommon(fs *flag.FlagSet, argv []string, args *commonArgs) error {
 	var timeout float64
 	fs.StringVar(&args.model, "model", defaultModel, "image model")
@@ -390,6 +629,7 @@ func parseCommon(fs *flag.FlagSet, argv []string, args *commonArgs) error {
 	fs.StringVar(&args.quality, "quality", defaultQuality, "low, medium, high, or auto")
 	fs.IntVar(&args.n, "n", 1, "number of variants (1-10)")
 	fs.StringVar(&args.outDir, "out-dir", defaultOutDir, "default output directory")
+	fs.StringVar(&args.configPath, "config", "", "optional config.toml path")
 	fs.BoolVar(&args.force, "force", false, "overwrite existing outputs")
 	fs.BoolVar(&args.dryRun, "dry-run", false, "validate without network access")
 	fs.IntVar(&args.maxAttempts, "max-attempts", 3, "maximum attempts")

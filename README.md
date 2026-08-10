@@ -8,7 +8,7 @@
 
 于是我写了这个 Skill。原理很简单：
 
-1. 从环境变量读取 API 地址和密钥；
+1. 优先读取用户级 `config.toml`，必要时再用环境变量覆盖；
 2. 直接调用 OpenAI 兼容的图片生成或编辑接口；
 3. 将返回的图片保存到项目中；
 4. 让 Codex 检查图片并展示最终结果。
@@ -61,6 +61,20 @@ cp -R codex-image2-skill/codex-image2 ~/.codex/skills/codex-image2
 
 ### 2. 配置 API 地址和密钥
 
+你可以选择两种方式。
+
+#### 方式一：写入 `~/.codex/config.toml`
+
+在用户目录的 `~/.codex/config.toml` 中添加：
+
+```toml
+[codex_image2]
+api_url = "你的API地址"
+api_key = "你的API密钥"
+```
+
+#### 方式二：使用环境变量
+
 在 PowerShell 中执行下面两条命令，可将环境变量永久保存到当前 Windows 用户：
 
 ```powershell
@@ -78,13 +92,21 @@ https://example.com
 
 ![配置 Codex Image2 环境变量](http://image.fengfengzhidao.com/fengfeng_110920260715224031.png?key=fengfengbuzhidao)
 
-> 配置完成后，需要完全退出并重新启动 Codex，新的环境变量才会生效。
+> `config.toml` 会在每次运行时重新读取；环境变量写入系统后，新的终端或 Codex 进程才会看到更新。
 
 macOS / Linux 用户可以将以下内容加入自己的 shell 配置文件：
 
 ```bash
 export CODEX_API_URL="你的API地址"
 export CODEX_API_KEY="你的API密钥"
+```
+
+如果你更习惯文件配置，也可以直接编辑 `~/.codex/config.toml`：
+
+```toml
+[codex_image2]
+api_url = "你的API地址"
+api_key = "你的API密钥"
 ```
 
 ### 3. 指定 Skill 生图
@@ -193,7 +215,7 @@ POST /v1/images/edits
 - 不要把真实 API Key 提交到 GitHub。
 - 不要把 Key 写进 Skill、提示词、截图或聊天消息。
 - 建议为不同服务使用独立密钥，并定期轮换。
-- 本 Skill 只从 `CODEX_API_KEY` 环境变量读取密钥，不会主动保存密钥。
+- 本 Skill 支持从 `~/.codex/config.toml` 或 `CODEX_API_KEY` 读取密钥，不会主动保存密钥。
 
 ## License
 
